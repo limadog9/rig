@@ -284,6 +284,11 @@ as `Rewrite::ChatDialect` and read the merged body, so a mapped option and a
 raw key drive them alike.
 
 Cross-cutting rules:
+- On the `openai` and `azure.openai` Chat dialects, video is sent as a
+  `video_url` part only when the requested model's facts declare `input.video`.
+  The bound spec takes precedence over the catalog; an unlisted model takes no
+  video. Gateways can opt in with `Chat::with_facts`. A video must be a URL or
+  base64 with a media type. Mistral still takes no video.
 - Reasoning levels depend on model and route: Azure documents `max` only on
   GPT-6 and GPT-5.6 with Responses, `xhigh` only on GPT-6, 5.6, 5.5, 5.4 and
   `gpt-5.1-codex-max`, `minimal` only on GPT-5, `none` from GPT-5.1

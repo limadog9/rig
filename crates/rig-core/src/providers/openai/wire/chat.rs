@@ -868,11 +868,12 @@ impl crate::completion::ReplayTarget for Chat {
 
     /// What the Chat encoder carries, by dialect: an image as a URL or
     /// typed data; audio as data; video as a URL or typed data, except to
-    /// OpenAI, Azure and Mistral; a PDF as data, or as a URL OpenRouter or
-    /// Mistral fetches; a file id where the dialect takes one; and a text
+    /// Mistral, and on OpenAI and Azure only when the model's facts list
+    /// video input; a PDF as data, or as a URL OpenRouter or Mistral fetches;
+    /// a file id where the dialect takes one; and a text
     /// document as text. Mira takes text only; DeepSeek, Perplexity and
     /// Cohere take no media but images, and Ollama only images as data.
-    fn encodes(&self, _model: &str, media: crate::completion::Media<'_>) -> bool {
+    fn encodes(&self, model: &str, media: crate::completion::Media<'_>) -> bool {
         use crate::completion::Media;
         let dialect = &self.provider.dialect;
         let rewrite = dialect.quirks.rewrite;
@@ -900,8 +901,12 @@ impl crate::completion::ReplayTarget for Chat {
             Media::Video(video) => {
                 files
                     && rewrite != BodyRewrite::Mistral
-                    && ![super::dialects::OPENAI.name, super::dialects::AZURE.name]
+                    && (![super::dialects::OPENAI.name, super::dialects::AZURE.name]
                         .contains(&dialect.name)
+                        || self
+                            .facts
+                            .for_model(dialect.name, model)
+                            .is_some_and(|spec| spec.input.video))
                     && linked(&video.data, video.media_type.is_some())
             }
             Media::Document(document) => {

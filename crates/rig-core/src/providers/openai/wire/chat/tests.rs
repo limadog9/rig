@@ -980,3 +980,180 @@ fn chat_forces_one_named_tool_at_most() {
     };
     assert!(tool_choice_value(choice).is_err());
 }
+
+fn video_spec(vendor: &str, model: &str, reads_video: bool) -> crate::catalog::ModelSpec {
+    let provider =
+        crate::providers::registry::ProviderId::catalog(vendor).expect("a catalog vendor");
+    let mut spec = crate::catalog::ModelSpec::new(provider, model);
+    spec.input.video = reads_video;
+    spec
+}
+
+fn video_body(chat: &Chat, model: &str, video: crate::message::Video, mode: Mode) -> Value {
+    let request = CompletionRequest::new(Message::User {
+        content: vec![
+            UserContent::text("Describe this video"),
+            UserContent::Video(video),
+        ],
+    })
+    .model(model);
+    let request = <Completion as crate::wire::Operation>::prepare(request, &chat.describe())
+        .expect("the video request prepares");
+    json_body(
+        &chat
+            .encode(request, mode)
+            .expect("the request encodes")
+            .request,
+    )
+}
+
+/// This tests caller-supplied gateway facts and request adaptation, not a
+/// provider reply; no live gateway recording is available for these overrides.
+#[test]
+fn video_parts_follow_bound_facts_on_openai_and_azure() {
+    use crate::message::{Video, VideoMediaType};
+    use crate::providers::openai::wire::AZURE;
+
+    for dialect in [&OPENAI, &AZURE] {
+        for reads_video in [false, true] {
+            let chat = OpenAIConfig::new("k")
+                .with_dialect(dialect)
+                .chat("gateway-video")
+                .with_facts(ModelFacts::new(video_spec(
+                    dialect.name,
+                    "gateway-video",
+                    reads_video,
+                )));
+            for mode in [Mode::Unary, Mode::Streaming] {
+                for (data, mime, url) in [
+                    (
+                        Source::Base64("dmlkZW8=".into()),
+                        Some(VideoMediaType::MP4),
+                        "data:video/mp4;base64,dmlkZW8=",
+                    ),
+                    (
+                        Source::Url("https://example.com/video.mp4".into()),
+                        None,
+                        "https://example.com/video.mp4",
+                    ),
+                ] {
+                    let body = video_body(
+                        &chat,
+                        "gateway-video",
+                        Video {
+                            data,
+                            media_type: mime,
+                            additional_params: None,
+                        },
+                        mode,
+                    );
+                    let expected = if reads_video {
+                        json!({"type": "video_url", "video_url": {"url": url}})
+                    } else {
+                        json!({"type": "text", "text": crate::completion::history::VIDEO_UNSENDABLE})
+                    };
+                    assert_eq!(
+                        body.pointer("/messages/0/content/1"),
+                        Some(&expected),
+                        "{} {reads_video} {mode:?}",
+                        dialect.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Catalog overrides and per-request model selection are local policy;
+/// a provider cassette cannot establish which caller-supplied facts win.
+#[test]
+fn video_facts_use_the_requested_model_and_bound_spec_before_the_catalog() {
+    use crate::completion::{Media, ReplayTarget};
+    use crate::message::{Video, VideoMediaType};
+    use crate::providers::openai::wire::AZURE;
+
+    let video = Video {
+        data: Source::Base64("dmlkZW8=".into()),
+        media_type: Some(VideoMediaType::MP4),
+        additional_params: None,
+    };
+    for dialect in [&OPENAI, &AZURE] {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog.insert(video_spec(dialect.name, "catalog-video", true));
+        catalog.insert(video_spec(dialect.name, "bound-text", true));
+        let chat = OpenAIConfig::new("k")
+            .with_dialect(dialect)
+            .chat("bound-text")
+            .with_facts(
+                ModelFacts::new(video_spec(dialect.name, "bound-text", false))
+                    .with_catalog(&catalog),
+            );
+        assert!(!chat.encodes("bound-text", Media::Video(&video)));
+        assert!(!chat.encodes("unlisted-model", Media::Video(&video)));
+        let body = video_body(&chat, "catalog-video", video.clone(), Mode::Unary);
+        assert_eq!(
+            body.pointer("/messages/0/content/1/video_url/url"),
+            Some(&json!("data:video/mp4;base64,dmlkZW8="))
+        );
+        let default = OpenAIConfig::new("k").with_dialect(dialect).chat("gpt-4o");
+        assert!(!default.encodes("gpt-4o", Media::Video(&video)));
+        assert!(!default.encodes("unlisted-model", Media::Video(&video)));
+    }
+}
+
+/// Wire source restrictions and dialect policy are independent of a live
+/// response; these cases exercise local filtering with explicit model facts.
+#[test]
+fn video_facts_preserve_source_and_other_dialect_restrictions() {
+    use crate::completion::{Media, ReplayTarget};
+    use crate::message::{Video, VideoMediaType};
+    use crate::providers::openai::wire::{AZURE, MISTRAL, MOONSHOT, OPENROUTER};
+
+    for dialect in [&OPENAI, &AZURE, &MISTRAL, &MOONSHOT, &OPENROUTER] {
+        let chat = OpenAIConfig::new("k")
+            .with_dialect(dialect)
+            .chat("video-model")
+            .with_facts(ModelFacts::new(video_spec(
+                dialect.name,
+                "video-model",
+                true,
+            )));
+        for (data, media_type, supported) in [
+            (
+                Source::Base64("dmlkZW8=".into()),
+                Some(VideoMediaType::MP4),
+                true,
+            ),
+            (Source::Base64("dmlkZW8=".into()), None, false),
+            (
+                Source::FileId("file-video".into()),
+                Some(VideoMediaType::MP4),
+                false,
+            ),
+            (Source::Unknown, None, false),
+        ] {
+            let video = Video {
+                data,
+                media_type,
+                additional_params: None,
+            };
+            assert_eq!(
+                chat.encodes("video-model", Media::Video(&video)),
+                supported && dialect.name != MISTRAL.name,
+                "{} {video:?}",
+                dialect.name
+            );
+        }
+        if [MOONSHOT.name, OPENROUTER.name].contains(&dialect.name) {
+            let video = Video {
+                data: Source::Url("https://example.com/video.mp4".into()),
+                media_type: None,
+                additional_params: None,
+            };
+            assert!(
+                chat.with_facts(ModelFacts::default())
+                    .encodes("video-model", Media::Video(&video))
+            );
+        }
+    }
+}
